@@ -1,22 +1,24 @@
 {
-  "name": "maricopa-server",
-  "version": "1.1.0",
-  "private": true,
-  "description": "CERIALS 1.0",
+  "name": "golden-harvest-cereals-server",
+  "version": "1.0.0",
+  "description": "Golden Harvest Cereals backend: Express, MongoDB Atlas and IntaSend M-Pesa STK Push",
   "main": "server.js",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
-  },
-  "engines": {
-    "node": ">=20"
+    "dev": "node --watch server.js",
+    "check": "node --check server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.21.0",
-    "express-rate-limit": "^7.4.0",
-    "helmet": "^7.1.0",
-    "mongoose": "^8.7.0"
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.0.0",
+    "mongoose": "^8.9.5"
   }
 }
