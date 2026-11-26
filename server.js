@@ -343,6 +343,7 @@ async function applyPaymentResult(orderId, r) {
         failedCode: null
       } }
     );
+    console.log(`[payment] recorded ${order.reference} KSh ${order.total} ref ${receipt || '-'} via ${r.via || 'intasend'}`);
     return;
   }
 
@@ -392,15 +393,16 @@ async function processWebhook(body) {
   });
 }
 
-/* Fallback when the webhook is late: ask IntaSend directly (throttled) */
+/* Fallback when the webhook is late or never arrives: ask IntaSend directly.
+   Starts 4s after the prompt and repeats at most every ~3.5s while the customer's page polls. */
 async function reconcile(order) {
   if (!intasendReady() || order.paymentStatus !== 'pending' || !order.checkoutRequestId) return;
   const now = Date.now();
-  if (!order.stkRequestedAt || now - order.stkRequestedAt.getTime() < 25000) return;
+  if (!order.stkRequestedAt || now - order.stkRequestedAt.getTime() < 4000) return;
   const claimed = await Order.findOneAndUpdate(
     {
       id: order.id, paymentStatus: 'pending',
-      $or: [{ lastQueryAt: null }, { lastQueryAt: { $lt: new Date(now - 8000) } }]
+      $or: [{ lastQueryAt: null }, { lastQueryAt: { $lt: new Date(now - 3500) } }]
     },
     { $set: { lastQueryAt: new Date() } }, { new: true }
   );
