@@ -3,32 +3,6 @@
    Golden Harvest Cereals — backend
    Express + MongoDB Atlas (mongoose) + IntaSend (M-Pesa STK Push)
    Requires Node 18+.
-
-   PUBLIC
-     GET  /health
-     GET  /api/products
-     POST /api/orders                      (needs Idempotency-Key header)
-     POST /api/intasend/stkpush
-     GET  /api/orders/:id/status
-   INTASEND (called by IntaSend)
-     POST /api/intasend/webhook            (challenge in body)
-     POST /api/intasend/webhook/:secret    (challenge in URL, optional)
-   ADMIN (HTTP Basic auth)
-     GET    /api/admin/products
-     POST   /api/admin/products
-     PUT    /api/admin/products/:id
-     DELETE /api/admin/products/:id
-     GET    /api/admin/orders?status=all|paid|pending|cancelled|released
-     POST   /api/admin/orders/:id/confirm
-     POST   /api/admin/orders/:id/reject
-     DELETE /api/admin/orders/:id            (unreleased orders only)
-
-   Environment variables
-     MONGODB_URI, ADMIN_USERNAME, ADMIN_PASSWORD,
-     INTASEND_PUBLISHABLE_KEY, INTASEND_SECRET_KEY, INTASEND_WEBHOOK_CHALLENGE,
-     PUBLIC_URL, INTASEND_ENV (sandbox|production),
-     ALLOWED_ORIGINS (comma separated, optional), COLLECTION_PREFIX (optional),
-     SEED_SAMPLE_PRODUCTS (true|false), PORT
    ===================================================================== */
 require('dotenv').config();
 const crypto = require('crypto');
@@ -244,16 +218,32 @@ function cleanProduct(b) {
 }
 
 /* ---------------- IntaSend API ---------------- */
-async function intasendPost(path, payload) {
+function authHeaders() {
+  return {
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+    Authorization: `Bearer ${INTASEND.secretKey}`
+  };
+}
+
+/* POST — used for STK push. 25 s timeout is fine here. */
+async function intasendPost(path, payload, timeoutMs = 25000) {
   const r = await fetch(INTASEND.base + path, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-      Authorization: `Bearer ${INTASEND.secretKey}`
-    },
+    headers: authHeaders(),
     body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(25000)
+    signal: AbortSignal.timeout(timeoutMs)
+  });
+  const data = await r.json().catch(() => ({}));
+  return { ok: r.ok, status: r.status, data };
+}
+
+/* GET — used for status queries. 8 s timeout keeps the storefront poll snappy. */
+async function intasendGet(path, timeoutMs = 8000) {
+  const r = await fetch(INTASEND.base + path, {
+    method: 'GET',
+    headers: authHeaders(),
+    signal: AbortSignal.timeout(timeoutMs)
   });
   const data = await r.json().catch(() => ({}));
   return { ok: r.ok, status: r.status, data };
@@ -290,14 +280,28 @@ async function intasendStkPush(order, phone) {
   return r.data;
 }
 
+/* FIX: IntaSend's status endpoint is a GET with invoice_id in the query string.
+   The old POST form returned 405/404 on most accounts, so reconcile() silently
+   never flipped orders to "paid" and the storefront had to wait for the
+   webhook (or its own poll timeout). */
 async function intasendQuery(invoiceId) {
   if (!invoiceId) return null;
-  const r = await intasendPost('/api/v1/payment/status/', { invoice_id: invoiceId });
-  return r.ok ? r.data : null;
+  try {
+    const g = await intasendGet(`/api/v1/payment/status/?invoice_id=${encodeURIComponent(invoiceId)}`);
+    if (g.ok) return g.data;
+    /* Fallback only if the account genuinely uses the POST form. */
+    if (g.status === 404 || g.status === 405) {
+      const p = await intasendPost('/api/v1/payment/status/', { invoice_id: invoiceId }, 8000);
+      return p.ok ? p.data : null;
+    }
+    return null;
+  } catch (e) {
+    console.warn('[intasend query]', e.message);
+    return null;
+  }
 }
 
-/* ---------------- Payment result handling (shared) ----------------
-   r = { state, providerRef, trackingId, invoiceId, value, failedCode, failedReason, via } */
+/* ---------------- Payment result handling (shared) ---------------- */
 async function applyPaymentResult(orderId, r) {
   const order = await Order.findOne({ id: orderId });
   if (!order) return;
@@ -348,7 +352,6 @@ async function applyPaymentResult(orderId, r) {
   }
 
   if (mapped === 'failed') {
-    /* Ignore failures of an older attempt once a newer prompt has been sent */
     if (r.invoiceId && order.invoiceId && r.invoiceId !== order.invoiceId) return;
     await Order.updateOne(
       { id: order.id, paymentStatus: 'pending' },
@@ -356,7 +359,7 @@ async function applyPaymentResult(orderId, r) {
         paymentStatus: 'failed',
         paymentMessage: String(r.failedReason || 'The M-Pesa payment was not completed.'),
         failedCode: Number.isFinite(r.failedCode) ? r.failedCode : null,
-        stkRequestedAt: null   // lets the customer retry straight away
+        stkRequestedAt: null
       } }
     );
   }
@@ -369,10 +372,12 @@ async function processWebhook(body) {
   const trackingId = String(body.tracking_id || body.intasend_tracking_id || '');
   const apiRef = String(body.api_ref || '');
 
-  let order = null;
-  if (invoiceId) order = await Order.findOne({ checkoutRequestIds: invoiceId });
-  if (!order && trackingId) order = await Order.findOne({ checkoutRequestIds: trackingId });
-  if (!order && apiRef) order = await Order.findOne({ reference: apiRef });   // webhook can beat our DB write
+  /* Single lookup instead of three. */
+  const or = [];
+  if (invoiceId) or.push({ checkoutRequestIds: invoiceId });
+  if (trackingId) or.push({ checkoutRequestIds: trackingId });
+  if (apiRef) or.push({ reference: apiRef });
+  const order = or.length ? await Order.findOne({ $or: or }) : null;
   if (!order) { console.warn('[intasend webhook] no order for', invoiceId || trackingId || apiRef); return; }
 
   if (invoiceId || trackingId) {
@@ -393,8 +398,8 @@ async function processWebhook(body) {
   });
 }
 
-/* Fallback when the webhook is late or never arrives: ask IntaSend directly.
-   Starts 4s after the prompt and repeats at most every ~3.5s while the customer's page polls. */
+/* Fallback when the webhook is late or never arrives. First query 4 s after the
+   prompt, at most one query per 3.5 s per order. */
 async function reconcile(order) {
   if (!intasendReady() || order.paymentStatus !== 'pending' || !order.checkoutRequestId) return;
   const now = Date.now();
@@ -439,8 +444,6 @@ const allowed = [...new Set((env.ALLOWED_ORIGINS || '').split(',').map(toOrigin)
 const allowAll = !allowed.length || allowed.includes('*');
 const originAllowed = origin => !origin || allowAll || allowed.includes(toOrigin(origin));
 
-/* Open CORS on /health so the pages can always diagnose connection problems.
-   intasend is a boolean: the pages test `h.intasend === false`. */
 app.get('/health', cors({ origin: true }), (req, res) => res.json({
   status: 'ok',
   db: mongoose.connection.readyState === 1,
@@ -468,6 +471,8 @@ const limiter = (windowMs, limit, message) =>
 const orderLimiter = limiter(60e3, 20, 'Too many orders. Please wait a minute.');
 const stkLimiter = limiter(60e3, 10, 'Too many payment requests. Please wait a minute.');
 const statusLimiter = limiter(60e3, 60, 'Too many status checks. Please slow down.');
+/* IntaSend retries on 5xx. Keep a generous cap so a broken deploy can't self-DDoS. */
+const webhookLimiter = limiter(60e3, 300, 'Too many webhook calls.');
 const adminLimiter = rateLimit({
   windowMs: 15 * 60e3, limit: 60, skipSuccessfulRequests: true, standardHeaders: true, legacyHeaders: false,
   message: { error: 'Too many failed attempts. Try again in 15 minutes.' }
@@ -553,7 +558,7 @@ app.post('/api/orders', orderLimiter, ah(async (req, res) => {
       if (e && e.code === 11000) {
         const dup = await Order.findOne({ idempotencyKey: key });
         if (dup) return res.json(summary(dup));
-        continue; // reference collision: try a new one
+        continue;
       }
       throw e;
     }
@@ -576,7 +581,6 @@ app.post('/api/intasend/stkpush', stkLimiter, ah(async (req, res) => {
     if (!ph) throw new HttpError(400, 'Enter a valid Safaricom number, e.g. 0712 345 678.');
   }
 
-  /* Atomically claim the right to send a prompt (blocks double-taps for 45s) */
   const cutoff = new Date(Date.now() - 45000);
   const order = await Order.findOneAndUpdate(
     {
@@ -649,11 +653,11 @@ const webhookHandler = ah(async (req, res) => {
   try { await processWebhook(req.body); }
   catch (e) {
     console.error('[intasend webhook]', e);
-    return res.status(500).json({ error: 'Processing failed.' }); // IntaSend will retry
+    return res.status(500).json({ error: 'Processing failed.' });
   }
   res.json({ ok: true });
 });
-app.post(['/api/intasend/webhook', '/api/intasend/webhook/:secret'], webhookHandler);
+app.post(['/api/intasend/webhook', '/api/intasend/webhook/:secret'], webhookLimiter, webhookHandler);
 
 /* ---- Public: order status (polled by the storefront) ---- */
 app.get('/api/orders/:id/status', statusLimiter, ah(async (req, res) => {
@@ -796,7 +800,14 @@ async function main() {
   if (!env.ADMIN_USERNAME || !env.ADMIN_PASSWORD) console.warn('⚠️  ADMIN_USERNAME / ADMIN_PASSWORD not set: admin login is disabled.');
   else if (env.ADMIN_PASSWORD.length < 10) console.warn('⚠️  ADMIN_PASSWORD is short. Use at least 12 characters.');
   if (!intasendReady()) console.warn('⚠️  IntaSend is not fully configured (need INTASEND_PUBLISHABLE_KEY, INTASEND_SECRET_KEY, INTASEND_WEBHOOK_CHALLENGE, PUBLIC_URL). Payments disabled.');
-  else console.log(`💳 IntaSend ${INTASEND.env}. Webhook URL: ${INTASEND.publicUrl}/api/intasend/webhook (challenge: your INTASEND_WEBHOOK_CHALLENGE)`);
+  else {
+    /* Loud, copy-pasteable reminder of exactly what must match the IntaSend dashboard. */
+    console.log(`💳 IntaSend ${INTASEND.env}.`);
+    console.log(`   Webhook URL: ${INTASEND.publicUrl}/api/intasend/webhook`);
+    console.log(`   Challenge length: ${INTASEND.webhookChallenge.length} chars (must match the dashboard exactly).`);
+    if (/\s/.test(INTASEND.webhookChallenge)) console.warn('⚠️  INTASEND_WEBHOOK_CHALLENGE contains whitespace. IntaSend will send a different value — fix the env var.');
+    if (/^["']|["']$/.test(INTASEND.webhookChallenge)) console.warn('⚠️  INTASEND_WEBHOOK_CHALLENGE has quote characters. Remove them in Render.');
+  }
   console.log('🌐 Allowed origins:', allowAll ? 'ANY' : allowed.join(', '));
   if (!allowed.length) console.warn('⚠️  ALLOWED_ORIGINS is empty: any website can call this API. Set it in production.');
 
