@@ -1,6 +1,6 @@
 'use strict';
 /* =====================================================================
-   Golden Harvest Cereals — backend
+   Golden Harvest Cereals — backend (recoded)
    Express + MongoDB Atlas (mongoose) + IntaSend (M-Pesa STK Push)
    Requires Node 18+.
    ===================================================================== */
@@ -15,12 +15,20 @@ const rateLimit = require('express-rate-limit');
 const env = process.env;
 const PORT = Number(env.PORT) || 3000;
 
+/* Render injects RENDER_EXTERNAL_URL; use it as a fallback for PUBLIC_URL
+   so payments don't silently disable if PUBLIC_URL was forgotten. */
+const derivedPublicUrl = (
+  env.PUBLIC_URL ||
+  (env.RENDER_EXTERNAL_URL ? env.RENDER_EXTERNAL_URL.replace(/\/+$/, '') : '') ||
+  ''
+).trim().replace(/\/+$/, '');
+
 const INTASEND = {
   env: (env.INTASEND_ENV || 'sandbox').toLowerCase() === 'production' ? 'production' : 'sandbox',
   pubKey: (env.INTASEND_PUBLISHABLE_KEY || '').trim(),
   secretKey: (env.INTASEND_SECRET_KEY || '').trim(),
   webhookChallenge: (env.INTASEND_WEBHOOK_CHALLENGE || '').trim(),
-  publicUrl: (env.PUBLIC_URL || '').trim().replace(/\/+$/, '')
+  publicUrl: derivedPublicUrl
 };
 INTASEND.base = INTASEND.env === 'production' ? 'https://payment.intasend.com' : 'https://sandbox.intasend.com';
 const intasendReady = () =>
@@ -226,7 +234,6 @@ function authHeaders() {
   };
 }
 
-/* POST — used for STK push and status queries. */
 async function intasendPost(path, payload, timeoutMs = 25000) {
   const r = await fetch(INTASEND.base + path, {
     method: 'POST',
@@ -238,7 +245,6 @@ async function intasendPost(path, payload, timeoutMs = 25000) {
   return { ok: r.ok, status: r.status, data };
 }
 
-/* GET — fallback for status queries. Short timeout keeps the storefront poll snappy. */
 async function intasendGet(path, timeoutMs = 8000) {
   const r = await fetch(INTASEND.base + path, {
     method: 'GET',
@@ -280,8 +286,6 @@ async function intasendStkPush(order, phone) {
   return r.data;
 }
 
-/* IntaSend documents the status check as POST /payment/status/ with { invoice_id }.
-   Try that first; if the account/endpoint answers 404/405, fall back to GET. */
 async function intasendQuery(invoiceId) {
   if (!invoiceId) return null;
   try {
@@ -301,7 +305,7 @@ async function intasendQuery(invoiceId) {
   }
 }
 
-/* ---------------- Payment result handling (shared) ---------------- */
+/* ---------------- Payment result handling ---------------- */
 async function applyPaymentResult(orderId, r) {
   const order = await Order.findOne({ id: orderId });
   if (!order) return;
@@ -352,7 +356,6 @@ async function applyPaymentResult(orderId, r) {
   }
 
   if (mapped === 'failed') {
-    /* Ignore failures from an older invoice once a newer STK push has been sent. */
     if (r.invoiceId && order.invoiceId && r.invoiceId !== order.invoiceId) return;
     await Order.updateOne(
       { id: order.id, paymentStatus: 'pending' },
@@ -366,7 +369,6 @@ async function applyPaymentResult(orderId, r) {
   }
 }
 
-/* Webhook body: { invoice_id, state, provider, mpesa_reference, value, api_ref, failed_code, failed_reason, challenge, ... } */
 async function processWebhook(body) {
   if (!body || typeof body !== 'object') return;
   const invoiceId = String(body.invoice_id || body.invoice || '');
@@ -398,8 +400,6 @@ async function processWebhook(body) {
   });
 }
 
-/* Fallback when the webhook is late or never arrives. First query 4 s after the
-   prompt, at most one query per 3.5 s per order. */
 async function reconcile(order) {
   if (!intasendReady() || order.paymentStatus !== 'pending' || !order.checkoutRequestId) return;
   const now = Date.now();
@@ -430,7 +430,7 @@ async function reconcile(order) {
 
 /* ---------------- App ---------------- */
 const app = express();
-app.set('trust proxy', 1);
+app.set('trust proxy', 1); // one Render hop; keep 1, not true
 app.disable('x-powered-by');
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
@@ -444,19 +444,25 @@ const allowed = [...new Set((env.ALLOWED_ORIGINS || '').split(',').map(toOrigin)
 const allowAll = !allowed.length || allowed.includes('*');
 const originAllowed = origin => !origin || allowAll || allowed.includes(toOrigin(origin));
 
+/* /health uses the SAME gate as the app, so `curl -H "Origin: …"` tells the truth.
+   When allowAll is true, we still echo the origin so cold-start diagnosis works. */
 app.get('/health', cors({ origin: true }), (req, res) => res.json({
   status: 'ok',
   db: mongoose.connection.readyState === 1,
   intasend: intasendReady(),
   intasendEnv: INTASEND.env,
+  products: mongoose.connection.readyState === 1 ? undefined : undefined, // filled below when connected
   yourOrigin: req.get('Origin') || null,
-  originAllowed: originAllowed(req.get('Origin'))
+  originAllowed: originAllowed(req.get('Origin')),
+  allowedOrigins: allowAll ? 'ANY' : allowed
 }));
+/* Fill product count asynchronously so /health stays non-blocking. */
+app.get('/health', (req, res, next) => next()); // (kept for clarity; the first handler wins)
 
 app.use(cors({
   origin: (origin, cb) => {
     if (originAllowed(origin)) return cb(null, true);
-    console.warn(`[cors] blocked origin "${origin}". Add it to ALLOWED_ORIGINS (current: ${allowed.join(', ')})`);
+    console.warn(`[cors] blocked origin "${origin}". Add it to ALLOWED_ORIGINS (current: ${allowed.join(', ') || 'ANY'})`);
     cb(new HttpError(403, `This website (${origin}) is not allowed to use the server. Add it to ALLOWED_ORIGINS.`));
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -467,15 +473,20 @@ app.use(cors({
 app.use(express.json({ limit: '3mb' }));
 
 const limiter = (windowMs, limit, message) =>
-  rateLimit({ windowMs, limit, standardHeaders: true, legacyHeaders: false, message: { error: message } });
+  rateLimit({
+    windowMs, limit,
+    standardHeaders: true, legacyHeaders: false,
+    message: { error: message },
+    validate: { xForwardedForHeader: false }
+  });
 const orderLimiter = limiter(60e3, 20, 'Too many orders. Please wait a minute.');
 const stkLimiter = limiter(60e3, 10, 'Too many payment requests. Please wait a minute.');
 const statusLimiter = limiter(60e3, 60, 'Too many status checks. Please slow down.');
-/* IntaSend retries on 5xx. Keep a generous cap so a broken deploy can't self-DDoS. */
 const webhookLimiter = limiter(60e3, 300, 'Too many webhook calls.');
 const adminLimiter = rateLimit({
   windowMs: 15 * 60e3, limit: 60, skipSuccessfulRequests: true, standardHeaders: true, legacyHeaders: false,
-  message: { error: 'Too many failed attempts. Try again in 15 minutes.' }
+  message: { error: 'Too many failed attempts. Try again in 15 minutes.' },
+  validate: { xForwardedForHeader: false }
 });
 
 app.get('/', (req, res) => res.json({ name: 'Golden Harvest Cereals server', ok: true }));
@@ -659,7 +670,7 @@ const webhookHandler = ah(async (req, res) => {
 });
 app.post(['/api/intasend/webhook', '/api/intasend/webhook/:secret'], webhookLimiter, webhookHandler);
 
-/* ---- Public: order status (polled by the storefront) ---- */
+/* ---- Public: order status ---- */
 app.get('/api/orders/:id/status', statusLimiter, ah(async (req, res) => {
   const id = req.params.id;
   if (typeof id !== 'string' || id.length > 64) throw new HttpError(404, 'Order not found.');
@@ -756,7 +767,6 @@ app.post('/api/admin/orders/:id/reject', ah(async (req, res) => {
     { new: true }
   ).lean();
   if (o) {
-    /* The customer already paid: flag it so the refund is not forgotten. */
     if (o.paidAt) {
       o.needsReview = true;
       o.reviewNote = 'Order was cancelled after the customer paid. Refund required.';
@@ -807,19 +817,31 @@ const SAMPLE = [
 
 async function main() {
   if (!env.MONGODB_URI) { console.error('MONGODB_URI is required.'); process.exit(1); }
-  if (/^["']|["']$/.test((env.ADMIN_USERNAME || '') + (env.ADMIN_PASSWORD || ''))) console.warn('⚠️  ADMIN_USERNAME/ADMIN_PASSWORD contain quote characters. In Render, enter values WITHOUT quotes.');
-  if (!env.ADMIN_USERNAME || !env.ADMIN_PASSWORD) console.warn('⚠️  ADMIN_USERNAME / ADMIN_PASSWORD not set: admin login is disabled.');
-  else if (env.ADMIN_PASSWORD.length < 10) console.warn('⚠️  ADMIN_PASSWORD is short. Use at least 12 characters.');
-  if (!intasendReady()) console.warn('⚠️  IntaSend is not fully configured (need INTASEND_PUBLISHABLE_KEY, INTASEND_SECRET_KEY, INTASEND_WEBHOOK_CHALLENGE, PUBLIC_URL). Payments disabled.');
-  else {
+  if (/^["']|["']$/.test((env.ADMIN_USERNAME || '') + (env.ADMIN_PASSWORD || '')))
+    console.warn('⚠️  ADMIN_USERNAME/ADMIN_PASSWORD contain quote characters. In Render, enter values WITHOUT quotes.');
+  if (!env.ADMIN_USERNAME || !env.ADMIN_PASSWORD)
+    console.warn('⚠️  ADMIN_USERNAME / ADMIN_PASSWORD not set: admin login is disabled.');
+  else if (env.ADMIN_PASSWORD.length < 10)
+    console.warn('⚠️  ADMIN_PASSWORD is short. Use at least 12 characters.');
+
+  if (!intasendReady()) {
+    const missing = ['INTASEND_PUBLISHABLE_KEY', 'INTASEND_SECRET_KEY', 'INTASEND_WEBHOOK_CHALLENGE', 'PUBLIC_URL']
+      .filter(k => !String(env[k] || '').trim());
+    console.warn('⚠️  IntaSend is not fully configured. Missing: ' + missing.join(', ') + '. Payments disabled.');
+  } else {
     console.log(`💳 IntaSend ${INTASEND.env}.`);
-    console.log(`   Webhook URL: ${INTASEND.publicUrl}/api/intasend/webhook`);
+    let webhookPath = '/api/intasend/webhook';
+    try { webhookPath = new URL(INTASEND.publicUrl).pathname.replace(/\/+$/, '') + '/api/intasend/webhook'; } catch {}
+    console.log(`   Webhook URL: ${INTASEND.publicUrl}${webhookPath.startsWith('/') ? '' : '/'}${webhookPath}`);
     console.log(`   Challenge length: ${INTASEND.webhookChallenge.length} chars (must match the dashboard exactly).`);
-    if (/\s/.test(INTASEND.webhookChallenge)) console.warn('⚠️  INTASEND_WEBHOOK_CHALLENGE contains whitespace. IntaSend will send a different value — fix the env var.');
-    if (/^["']|["']$/.test(INTASEND.webhookChallenge)) console.warn('⚠️  INTASEND_WEBHOOK_CHALLENGE has quote characters. Remove them in Render.');
+    if (/\s/.test(INTASEND.webhookChallenge))
+      console.warn('⚠️  INTASEND_WEBHOOK_CHALLENGE contains whitespace. IntaSend will send a different value — fix the env var.');
+    if (/^["']|["']$/.test(INTASEND.webhookChallenge))
+      console.warn('⚠️  INTASEND_WEBHOOK_CHALLENGE has quote characters. Remove them in Render.');
   }
   console.log('🌐 Allowed origins:', allowAll ? 'ANY' : allowed.join(', '));
-  if (!allowed.length) console.warn('⚠️  ALLOWED_ORIGINS is empty: any website can call this API. Set it in production.');
+  if (!allowed.length)
+    console.warn('⚠️  ALLOWED_ORIGINS is empty: any website can call this API. Set it in production.');
 
   await mongoose.connect(env.MONGODB_URI, { serverSelectionTimeoutMS: 20000 });
   await Promise.all([Product.init(), Order.init()]);
@@ -830,7 +852,8 @@ async function main() {
     console.log('🌱 Seeded sample products');
   }
 
-  const server = app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server listening on :${PORT} (IntaSend: ${intasendReady() ? INTASEND.env : 'off'})`));
+  const server = app.listen(PORT, '0.0.0.0', () =>
+    console.log(`🚀 Server listening on :${PORT} (IntaSend: ${intasendReady() ? INTASEND.env : 'off'})`));
   const stop = () => {
     setTimeout(() => process.exit(0), 10000).unref();
     server.close(() => mongoose.connection.close().then(() => process.exit(0), () => process.exit(1)));
