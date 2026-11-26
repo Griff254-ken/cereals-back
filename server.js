@@ -226,7 +226,7 @@ function authHeaders() {
   };
 }
 
-/* POST — used for STK push. 25 s timeout is fine here. */
+/* POST — used for STK push and status queries. */
 async function intasendPost(path, payload, timeoutMs = 25000) {
   const r = await fetch(INTASEND.base + path, {
     method: 'POST',
@@ -238,7 +238,7 @@ async function intasendPost(path, payload, timeoutMs = 25000) {
   return { ok: r.ok, status: r.status, data };
 }
 
-/* GET — used for status queries. 8 s timeout keeps the storefront poll snappy. */
+/* GET — fallback for status queries. Short timeout keeps the storefront poll snappy. */
 async function intasendGet(path, timeoutMs = 8000) {
   const r = await fetch(INTASEND.base + path, {
     method: 'GET',
@@ -280,20 +280,20 @@ async function intasendStkPush(order, phone) {
   return r.data;
 }
 
-/* FIX: IntaSend's status endpoint is a GET with invoice_id in the query string.
-   The old POST form returned 405/404 on most accounts, so reconcile() silently
-   never flipped orders to "paid" and the storefront had to wait for the
-   webhook (or its own poll timeout). */
+/* IntaSend documents the status check as POST /payment/status/ with { invoice_id }.
+   Try that first; if the account/endpoint answers 404/405, fall back to GET. */
 async function intasendQuery(invoiceId) {
   if (!invoiceId) return null;
   try {
-    const g = await intasendGet(`/api/v1/payment/status/?invoice_id=${encodeURIComponent(invoiceId)}`);
-    if (g.ok) return g.data;
-    /* Fallback only if the account genuinely uses the POST form. */
-    if (g.status === 404 || g.status === 405) {
-      const p = await intasendPost('/api/v1/payment/status/', { invoice_id: invoiceId }, 8000);
-      return p.ok ? p.data : null;
+    const p = await intasendPost('/api/v1/payment/status/', { invoice_id: invoiceId }, 8000);
+    if (p.ok) return p.data;
+    if (p.status === 404 || p.status === 405) {
+      const g = await intasendGet(`/api/v1/payment/status/?invoice_id=${encodeURIComponent(invoiceId)}`);
+      if (g.ok) return g.data;
+      console.warn('[intasend query] GET fallback failed', g.status, intasendError(g.data));
+      return null;
     }
+    console.warn('[intasend query] failed', p.status, intasendError(p.data));
     return null;
   } catch (e) {
     console.warn('[intasend query]', e.message);
@@ -352,6 +352,7 @@ async function applyPaymentResult(orderId, r) {
   }
 
   if (mapped === 'failed') {
+    /* Ignore failures from an older invoice once a newer STK push has been sent. */
     if (r.invoiceId && order.invoiceId && r.invoiceId !== order.invoiceId) return;
     await Order.updateOne(
       { id: order.id, paymentStatus: 'pending' },
@@ -372,7 +373,6 @@ async function processWebhook(body) {
   const trackingId = String(body.tracking_id || body.intasend_tracking_id || '');
   const apiRef = String(body.api_ref || '');
 
-  /* Single lookup instead of three. */
   const or = [];
   if (invoiceId) or.push({ checkoutRequestIds: invoiceId });
   if (trackingId) or.push({ checkoutRequestIds: trackingId });
@@ -668,6 +668,7 @@ app.get('/api/orders/:id/status', statusLimiter, ah(async (req, res) => {
   if (o.paymentStatus === 'pending') {
     await reconcile(o);
     o = await Order.findOne({ id });
+    if (!o) throw new HttpError(404, 'Order not found.');
   }
   const paid = o.paymentStatus === 'paid';
   res.json({
@@ -730,7 +731,8 @@ const ORDER_FILTERS = {
   released: { adminConfirmed: true }
 };
 app.get('/api/admin/orders', ah(async (req, res) => {
-  const f = ORDER_FILTERS[String(req.query.status || 'all')] || ORDER_FILTERS.all;
+  const k = String(req.query.status || 'all');
+  const f = Object.hasOwn(ORDER_FILTERS, k) ? ORDER_FILTERS[k] : ORDER_FILTERS.all;
   const list = await Order.find(f).sort({ createdAt: -1 }).limit(500).lean();
   res.json({ orders: list.map(orderOut) });
 }));
@@ -753,7 +755,15 @@ app.post('/api/admin/orders/:id/reject', ah(async (req, res) => {
     { $set: { paymentStatus: 'cancelled', cancelledAt: new Date(), paymentMessage: 'This order was cancelled by the store.' } },
     { new: true }
   ).lean();
-  if (o) return res.json({ order: orderOut(o) });
+  if (o) {
+    /* The customer already paid: flag it so the refund is not forgotten. */
+    if (o.paidAt) {
+      o.needsReview = true;
+      o.reviewNote = 'Order was cancelled after the customer paid. Refund required.';
+      await Order.updateOne({ id: o.id }, { $set: { needsReview: true, reviewNote: o.reviewNote } });
+    }
+    return res.json({ order: orderOut(o) });
+  }
   const cur = await Order.findOne({ id: req.params.id }).lean();
   if (!cur) throw new HttpError(404, 'Order not found.');
   if (cur.adminConfirmed) throw new HttpError(409, 'This order has already been released and cannot be cancelled.');
@@ -763,6 +773,7 @@ app.delete('/api/admin/orders/:id', ah(async (req, res) => {
   const cur = await Order.findOne({ id: req.params.id }).lean();
   if (!cur) throw new HttpError(404, 'Order not found.');
   if (cur.adminConfirmed) throw new HttpError(409, 'Released orders cannot be deleted. They are kept as a record.');
+  if (cur.paymentStatus === 'paid') throw new HttpError(409, 'Paid orders cannot be deleted. Cancel (and refund) the order first.');
   await Order.deleteOne({ id: req.params.id });
   res.json({ ok: true });
 }));
@@ -774,7 +785,7 @@ app.use((err, req, res, next) => {
   if (err instanceof HttpError) return res.status(err.status).json({ error: err.message });
   if (err && err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Invalid JSON.' });
   if (err && err.type === 'entity.too.large') return res.status(413).json({ error: 'The request is too large.' });
-  if (err && err.name === 'ValidationError') return res.status(400).json({ error: err.message });
+  if (err && (err.name === 'ValidationError' || err.name === 'CastError')) return res.status(400).json({ error: err.message });
   console.error('[error]', err);
   res.status(500).json({ error: 'Something went wrong on the server.' });
 });
@@ -801,7 +812,6 @@ async function main() {
   else if (env.ADMIN_PASSWORD.length < 10) console.warn('⚠️  ADMIN_PASSWORD is short. Use at least 12 characters.');
   if (!intasendReady()) console.warn('⚠️  IntaSend is not fully configured (need INTASEND_PUBLISHABLE_KEY, INTASEND_SECRET_KEY, INTASEND_WEBHOOK_CHALLENGE, PUBLIC_URL). Payments disabled.');
   else {
-    /* Loud, copy-pasteable reminder of exactly what must match the IntaSend dashboard. */
     console.log(`💳 IntaSend ${INTASEND.env}.`);
     console.log(`   Webhook URL: ${INTASEND.publicUrl}/api/intasend/webhook`);
     console.log(`   Challenge length: ${INTASEND.webhookChallenge.length} chars (must match the dashboard exactly).`);
@@ -821,7 +831,10 @@ async function main() {
   }
 
   const server = app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server listening on :${PORT} (IntaSend: ${intasendReady() ? INTASEND.env : 'off'})`));
-  const stop = () => server.close(() => mongoose.connection.close().then(() => process.exit(0)));
+  const stop = () => {
+    setTimeout(() => process.exit(0), 10000).unref();
+    server.close(() => mongoose.connection.close().then(() => process.exit(0), () => process.exit(1)));
+  };
   process.on('SIGTERM', stop);
   process.on('SIGINT', stop);
 }
