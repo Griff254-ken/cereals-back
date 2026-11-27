@@ -1,33 +1,8 @@
 'use strict';
-/* =====================================================================
-   Golden Harvest Cereals — API server (Express + MongoDB Atlas + IntaSend M-Pesa)
 
-   Matches the storefront (cereals.html) and admin console (admin.html):
-     Public : GET  /health
-              GET  /api/products
-              GET  /api/products/:id/image
-              POST /api/orders                    (Idempotency-Key header)
-              POST /api/intasend/stkpush
-              GET  /api/orders/:id/status
-              POST /api/intasend/webhook          (set this URL in IntaSend)
-     Admin  : HTTP Basic auth (ADMIN_USERNAME / ADMIN_PASSWORD)
-              GET/POST/PUT/DELETE /api/admin/products[/:id]
-              GET  /api/admin/orders?status=all
-              POST /api/admin/orders/:id/confirm | /reject | /resolve-review
-              DELETE /api/admin/orders/:id
-
-   Why payments are fast and reliable here:
-     * The HTTP port opens immediately; MongoDB connects in the background
-       (no Render "no open port" timeouts, /health reports db state).
-     * The status endpoint ACTIVELY asks IntaSend about a pending payment
-       (throttled), so the customer sees "paid" in seconds even if the
-       webhook is late. The webhook is verified against IntaSend's status
-       API before anything is marked paid.
-     * A background reconciler settles payments for customers who closed
-       the page, and every state change is atomic and idempotent.
-     * Product photos are served from their own cacheable URL, so the
-       product list stays tiny.
-   ===================================================================== */
+try {
+  if (typeof process.loadEnvFile === 'function') process.loadEnvFile();
+} catch { /* no .env file: that is fine */ }
 
 const crypto = require('node:crypto');
 const express = require('express');
@@ -41,22 +16,24 @@ const env = process.env;
 const int = (v, d) => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : d; };
 const bool = (v, d = false) => (v == null || v === '' ? d : /^(1|true|yes|on)$/i.test(String(v)));
 const trimSlash = s => String(s || '').trim().replace(/\/+$/, '');
+// Render values are often pasted with stray spaces or quotes: strip them.
+const clean = v => String(v ?? '').trim().replace(/^(['"])(.*)\1$/, '$2').trim();
 
 const CFG = {
   PORT: int(env.PORT, 3000),
   NODE_ENV: env.NODE_ENV || 'production',
-  MONGODB_URI: env.MONGODB_URI || '',
-  DB_NAME: env.DB_NAME || 'golden_harvest',
+  MONGODB_URI: clean(env.MONGODB_URI),
+  DB_NAME: clean(env.DB_NAME) || 'golden_harvest',
   MONGO_POOL: int(env.MONGO_POOL_SIZE, 10),
-  ALLOWED_ORIGINS: String(env.ALLOWED_ORIGINS || '').split(',').map(s => trimSlash(s).toLowerCase()).filter(Boolean),
-  PUBLIC_URL: trimSlash(env.PUBLIC_URL),
-  ADMIN_USERNAME: env.ADMIN_USERNAME || '',
-  ADMIN_PASSWORD: env.ADMIN_PASSWORD || '',
-  INTASEND_PUBLISHABLE_KEY: env.INTASEND_PUBLISHABLE_KEY || '',
-  INTASEND_SECRET_KEY: env.INTASEND_SECRET_KEY || '',
-  INTASEND_WEBHOOK_CHALLENGE: env.INTASEND_WEBHOOK_CHALLENGE || '',
-  INTASEND_TEST: bool(env.INTASEND_TEST, false),          // true = sandbox.intasend.com
-  SEED_SAMPLE_PRODUCTS: bool(env.SEED_SAMPLE_PRODUCTS, false),
+  ALLOWED_ORIGINS: String(env.ALLOWED_ORIGINS || '').split(',').map(s => trimSlash(clean(s)).toLowerCase()).filter(Boolean),
+  PUBLIC_URL: trimSlash(clean(env.PUBLIC_URL)),
+  ADMIN_USERNAME: clean(env.ADMIN_USERNAME),
+  ADMIN_PASSWORD: clean(env.ADMIN_PASSWORD),
+  INTASEND_PUBLISHABLE_KEY: clean(env.INTASEND_PUBLISHABLE_KEY),
+  INTASEND_SECRET_KEY: clean(env.INTASEND_SECRET_KEY),
+  INTASEND_WEBHOOK_CHALLENGE: clean(env.INTASEND_WEBHOOK_CHALLENGE),
+  INTASEND_TEST: bool(clean(env.INTASEND_TEST), false),   // true = sandbox.intasend.com
+  SEED_SAMPLE_PRODUCTS: bool(clean(env.SEED_SAMPLE_PRODUCTS), false),
   STK_COOLDOWN_MS: int(env.STK_COOLDOWN_MS, 25000),       // min gap between prompts for one order
   STATUS_CHECK_MS: int(env.STATUS_CHECK_MS, 4000),        // min gap between IntaSend lookups per order
   RECONCILE_MS: int(env.RECONCILE_MS, 60000),
@@ -65,9 +42,17 @@ const CFG = {
 };
 
 const ANY_ORIGIN = CFG.ALLOWED_ORIGINS.length === 0;
+
+// IntaSend sandbox keys contain "_test_" and only work on sandbox.intasend.com;
+// live keys only work on payment.intasend.com. Trust the keys over the flag so a
+// wrong INTASEND_TEST value can never break payments.
+const KEYS_ARE_TEST = /_test_/i.test(CFG.INTASEND_SECRET_KEY) || /_test_/i.test(CFG.INTASEND_PUBLISHABLE_KEY);
+const KEYS_ARE_LIVE = /_live_/i.test(CFG.INTASEND_SECRET_KEY) || /_live_/i.test(CFG.INTASEND_PUBLISHABLE_KEY);
+const SANDBOX = KEYS_ARE_TEST ? true : KEYS_ARE_LIVE ? false : CFG.INTASEND_TEST;
 const IS = {
   configured: !!(CFG.INTASEND_PUBLISHABLE_KEY && CFG.INTASEND_SECRET_KEY && CFG.INTASEND_WEBHOOK_CHALLENGE),
-  base: CFG.INTASEND_TEST ? 'https://sandbox.intasend.com' : 'https://payment.intasend.com'
+  sandbox: SANDBOX,
+  base: SANDBOX ? 'https://sandbox.intasend.com' : 'https://payment.intasend.com'
 };
 
 /* ------------------------------ Utils ------------------------------- */
@@ -108,7 +93,7 @@ function newReference() {
 }
 
 /* ------------------------------ Database ---------------------------- */
-let client = null, db = null, dbReady = false, shuttingDown = false;
+let client = null, db = null, dbReady = false, shuttingDown = false, lastDbError = '';
 const col = {};
 
 async function ensureIndexes() {
@@ -144,10 +129,16 @@ async function connectDb() {
       await ensureIndexes();
       if (CFG.SEED_SAMPLE_PRODUCTS) await seedProducts();
       dbReady = true;
+      lastDbError = '';
       log('info', 'mongodb connected', { db: CFG.DB_NAME });
       return;
     } catch (e) {
-      log('error', 'mongodb connection failed, retrying', { err: e.message, retryInMs: delay });
+      lastDbError = String(e.message || e).slice(0, 200);
+      let hint = '';
+      if (/bad auth|authentication failed/i.test(lastDbError)) hint = 'Check the database username/password in MONGODB_URI (special characters in the password must be URL-encoded).';
+      else if (/ENOTFOUND|querySrv|ECONNREFUSED/i.test(lastDbError)) hint = 'Check the cluster host name in MONGODB_URI.';
+      else if (/Server selection timed out|ReplicaSetNoPrimary|whitelist|IP/i.test(lastDbError)) hint = 'In MongoDB Atlas > Network Access, allow 0.0.0.0/0 so Render can connect.';
+      log('error', 'mongodb connection failed, retrying', { err: lastDbError, hint, retryInMs: delay });
       try { await client?.close(); } catch { /* ignore */ }
       await sleep(delay);
       delay = Math.min(delay * 2, 30000);
@@ -448,7 +439,7 @@ app.use((req, res, next) => {       // request id + access log
   res.setHeader('X-Request-Id', req.id);
   const t0 = process.hrtime.bigint();
   res.on('finish', () => {
-    if (req.path === '/health') return;
+    if (req.path === '/health' || req.path === '/healthz') return;
     log('info', 'req', { id: req.id, method: req.method, path: req.path, status: res.statusCode, ms: Number((process.hrtime.bigint() - t0) / 1000000n) });
   });
   next();
@@ -456,7 +447,7 @@ app.use((req, res, next) => {       // request id + access log
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(compression());
 
-const originAllowed = o => !o || ANY_ORIGIN || CFG.ALLOWED_ORIGINS.includes(String(o).toLowerCase());
+const originAllowed = o => !o || ANY_ORIGIN || CFG.ALLOWED_ORIGINS.includes(trimSlash(o).toLowerCase());
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   const ok = originAllowed(origin);
@@ -496,7 +487,10 @@ app.get('/', (req, res) => res.json({ service: 'golden-harvest-api', ok: true })
 app.get(['/health', '/healthz'], ah(async (req, res) => {
   const database = await dbPing();
   res.set('Cache-Control', 'no-store').json({
-    ok: true, db: database, intasend: IS.configured, sandbox: CFG.INTASEND_TEST,
+    ok: true, db: database,
+    dbConfigured: !!CFG.MONGODB_URI,
+    dbError: database ? undefined : (CFG.MONGODB_URI ? lastDbError || undefined : 'MONGODB_URI is not set'),
+    intasend: IS.configured, sandbox: IS.sandbox,
     adminConfigured: !!(CFG.ADMIN_USERNAME && CFG.ADMIN_PASSWORD),
     originAllowed: originAllowed(req.headers.origin),
     allowedOrigins: ANY_ORIGIN ? 'ANY' : CFG.ALLOWED_ORIGINS,
@@ -826,20 +820,25 @@ async function reconcile() {
 }
 
 /* -------------------------------- Boot ------------------------------ */
-if (!CFG.MONGODB_URI) { log('error', 'MONGODB_URI is not set'); process.exit(1); }
+// A missing MONGODB_URI no longer kills the process (which made Render restart it
+// in a loop with no way to inspect it). The server stays up, /health reports the
+// problem, and API calls answer 503 until the variable is set and redeployed.
+if (!CFG.MONGODB_URI) log('error', 'MONGODB_URI is not set. On Render, add it under Environment (a local .env file is not deployed). The database will not connect until it is set.');
+else if (!/^mongodb(\+srv)?:\/\//i.test(CFG.MONGODB_URI)) log('error', 'MONGODB_URI looks wrong: it must start with mongodb:// or mongodb+srv://');
 if (!CFG.ADMIN_USERNAME || !CFG.ADMIN_PASSWORD) log('warn', 'ADMIN_USERNAME / ADMIN_PASSWORD not set: admin login is disabled');
 else if (CFG.ADMIN_PASSWORD.length < 10) log('warn', 'ADMIN_PASSWORD is short; use at least 12 characters');
 if (!IS.configured) log('warn', 'IntaSend not fully configured (need INTASEND_PUBLISHABLE_KEY, INTASEND_SECRET_KEY, INTASEND_WEBHOOK_CHALLENGE)');
+else if (CFG.INTASEND_TEST !== IS.sandbox) log('warn', `INTASEND_TEST=${CFG.INTASEND_TEST} does not match your IntaSend keys, so ${IS.sandbox ? 'SANDBOX' : 'LIVE'} mode is being used. Set INTASEND_TEST=${IS.sandbox} to remove this warning.`);
 if (ANY_ORIGIN) log('warn', 'ALLOWED_ORIGINS is empty: any website may call this API. Set it to your storefront/admin origins.');
 
 const server = app.listen(CFG.PORT, '0.0.0.0', () => {
-  log('info', 'server listening', { port: CFG.PORT, sandbox: CFG.INTASEND_TEST, webhook: CFG.PUBLIC_URL ? `${CFG.PUBLIC_URL}/api/intasend/webhook` : '(set PUBLIC_URL)' });
+  log('info', 'server listening', { port: CFG.PORT, sandbox: IS.sandbox, webhook: CFG.PUBLIC_URL ? `${CFG.PUBLIC_URL}/api/intasend/webhook` : '(set PUBLIC_URL)' });
 });
 server.keepAliveTimeout = 65000;   // longer than the load balancer's idle timeout
 server.headersTimeout = 66000;
 server.requestTimeout = 60000;
 
-connectDb();
+if (/^mongodb(\+srv)?:\/\//i.test(CFG.MONGODB_URI)) connectDb();
 const reconTimer = setInterval(reconcile, CFG.RECONCILE_MS);
 reconTimer.unref();
 
