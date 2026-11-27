@@ -1,13 +1,19 @@
 {
   "name": "golden-harvest-api",
   "version": "1.0.0",
-  "private": true,
-  "description": "Golden Harvest Cereals API (Express, MongoDB Atlas, IntaSend M-Pesa)",
+  "description": "Golden Harvest Cereals API: Express, MongoDB Atlas and IntaSend M-Pesa",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=20" },
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "check": "node --check server.js"
+  },
+  "engines": {
+    "node": ">=20.12.0"
+  },
   "dependencies": {
-    "compression": "^1.7.4",
+    "compression": "^1.8.0",
     "express": "^4.21.2",
     "express-rate-limit": "^7.5.0",
     "helmet": "^8.0.0",
